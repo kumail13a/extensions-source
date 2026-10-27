@@ -1,4 +1,5 @@
 import io.github.keiyoushi.gradle.api.ContentWarning
+
 plugins {
     alias(kei.plugins.extension)
 }
@@ -6,7 +7,7 @@ plugins {
 keiyoushi {
     name = "Universal"
     versionCode = 1
-contentWarning = ContentWarning.NSFW
+    contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 
     source {
