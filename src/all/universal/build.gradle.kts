@@ -6,6 +6,7 @@ plugins {
 keiyoushi {
     name = "Universal"
     versionCode = 1
+contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 
     source {
