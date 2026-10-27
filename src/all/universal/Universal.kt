@@ -1,213 +1,167 @@
 package eu.kanade.tachiyomi.extension.all.universal
 
-import android.app.Application
-import android.content.SharedPreferences
-import androidx.preference.EditTextPreference
-import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
+import keiyoushi.annotation.Source
+import keiyoushi.network.get
+import keiyoushi.network.post
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
+import kotlinx.serialization.json.JsonElement
+import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Request
-import okhttp3.Response
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
 
-/**
- * Universal source: the user enters a site URL in the extension settings,
- * the source detects the site's theme (Madara / MangaThemesia) and adapts.
- */
-class Universal : ConfigurableSource, HttpSource() {
+@Source
+abstract class Universal : KeiSource() {
 
-    override val name = "Universal"
-    override val lang = "all"
-    override val supportsLatest = true
-
-    private val preferences: SharedPreferences by lazy {
-        Injekt.get<Application>().getSharedPreferences("source_$id", 0x0000)
+    private enum class Theme {
+        Madara,
+        Themesia,
     }
 
-    // The site address typed by the user
-    override val baseUrl: String
-        get() = preferences.getString(BASE_URL_PREF, "")!!.trim().trimEnd('/')
-
-    private enum class Theme { MADARA, THEMESIA }
-
-    // Detected once per base URL, then cached
     private var cachedTheme: Pair<String, Theme>? = null
 
-    private fun theme(): Theme {
-        val base = baseUrl
-        if (base.isBlank()) throw Exception("افتح إعدادات المصدر وأدخل رابط الموقع")
-        cachedTheme?.let { if (it.first == base) return it.second }
-
-        val html = client.newCall(GET(base, headers)).execute().use { it.body.string() }
+    private suspend fun theme(): Theme {
+        cachedTheme?.takeIf { it.first == baseUrl }?.let { return it.second }
+        val html = client.get(baseUrl).asJsoup().html()
         val detected = when {
-            html.contains("wp-manga", true) || html.contains("madara", true) -> Theme.MADARA
-            html.contains("ts_reader", true) || html.contains("listupd", true) ||
-                html.contains("mangastream", true) -> Theme.THEMESIA
-            else -> throw Exception("قالب الموقع غير مدعوم حالياً")
+            html.contains("wp-manga", true) || html.contains("madara", true) -> Theme.Madara
+            html.contains("ts_reader", true) || html.contains("listupd", true) -> Theme.Themesia
+            else -> error("Unsupported site theme")
         }
-        cachedTheme = base to detected
+        cachedTheme = baseUrl to detected
         return detected
     }
 
-    // ---------- Settings ----------
-
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        EditTextPreference(screen.context).apply {
-            key = BASE_URL_PREF
-            title = "رابط الموقع"
-            summary = "مثال: https://example.com"
-            dialogTitle = "رابط الموقع"
-            setDefaultValue("")
-            setOnPreferenceChangeListener { _, newValue ->
-                val v = (newValue as String).trim()
-                // Validate before saving
-                runCatching { v.toHttpUrl() }.isSuccess || v.isEmpty()
-            }
-        }.also(screen::addPreference)
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val url = when (theme()) {
+            Theme.Madara -> "$baseUrl/manga/page/$page/?m_orderby=views"
+            Theme.Themesia -> "$baseUrl/manga/?page=$page&order=popular"
+        }
+        return parseList(client.get(url).asJsoup())
     }
 
-    // ---------- Popular ----------
-
-    override fun popularMangaRequest(page: Int): Request = when (theme()) {
-        Theme.MADARA -> GET("$baseUrl/manga/page/$page/?m_orderby=views", headers)
-        Theme.THEMESIA -> GET("$baseUrl/manga/?page=$page&order=popular", headers)
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val url = when (theme()) {
+            Theme.Madara -> "$baseUrl/manga/page/$page/?m_orderby=latest"
+            Theme.Themesia -> "$baseUrl/manga/?page=$page&order=update"
+        }
+        return parseList(client.get(url).asJsoup())
     }
 
-    override fun popularMangaParse(response: Response): MangasPage = parseList(response)
-
-    // ---------- Latest ----------
-
-    override fun latestUpdatesRequest(page: Int): Request = when (theme()) {
-        Theme.MADARA -> GET("$baseUrl/manga/page/$page/?m_orderby=latest", headers)
-        Theme.THEMESIA -> GET("$baseUrl/manga/?page=$page&order=update", headers)
-    }
-
-    override fun latestUpdatesParse(response: Response): MangasPage = parseList(response)
-
-    // ---------- Search ----------
-
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val isMadara = theme() == Theme.Madara
         val url = baseUrl.toHttpUrl().newBuilder().apply {
             if (page > 1) addPathSegments("page/$page/")
             addQueryParameter("s", query)
-            if (theme() == Theme.MADARA) addQueryParameter("post_type", "wp-manga")
+            if (isMadara) addQueryParameter("post_type", "wp-manga")
         }.build()
-        return GET(url, headers)
+        return parseList(client.get(url).asJsoup())
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = parseList(response)
-
-    // ---------- List parsing (shared) ----------
-
-    private fun parseList(response: Response): MangasPage {
-        val doc = response.asJsoup()
-        val items = doc.select(
-            "div.page-item-detail, div.c-tabs-item__content, " + // Madara
-                ".listupd .bs .bsx, .listupd .utao .uta", // MangaThemesia
+    private fun parseList(document: Document): MangasPage {
+        val items = document.select(
+            "div.page-item-detail, div.c-tabs-item__content, .listupd .bs .bsx, .listupd .utao .uta",
         )
-        val mangas = items.mapNotNull { el ->
-            val link = el.selectFirst("h3 a, h5 a, .post-title a, a[title], a[href]") ?: return@mapNotNull null
+        val mangas = items.mapNotNull { element ->
+            val link = element.selectFirst("h3 a, h5 a, .post-title a, a[title], a[href]")
+                ?: return@mapNotNull null
+            val href = link.attr("abs:href").takeIf(String::isNotBlank) ?: return@mapNotNull null
             SManga.create().apply {
-                setUrlWithoutDomain(link.absUrl("href"))
+                url = href.toHttpUrl().encodedPath
                 title = link.attr("title").ifBlank { link.text() }
-                    .ifBlank { el.selectFirst("img")?.attr("alt").orEmpty() }
-                thumbnail_url = el.selectFirst("img")?.let(::imgUrl)
+                    .ifBlank { element.selectFirst("img")?.attr("alt").orEmpty() }
+                thumbnail_url = element.selectFirst("img")?.let(::imageUrl)
             }
         }.distinctBy { it.url }
-        val hasNext = doc.selectFirst("a.next, .nav-previous a, .hpage a.r, a.nextpostslink") != null
+        val hasNext = document.selectFirst("a.next, a.nextpostslink, .hpage a.r") != null
         return MangasPage(mangas, hasNext)
     }
 
-    // ---------- Details ----------
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(baseUrl + manga.url).asJsoup()
+        val details = if (fetchDetails) parseDetails(document, manga.url) else manga
+        val chapterList = if (fetchChapters) parseChapters(document, manga.url) else chapters
+        return SMangaUpdate(details, chapterList)
+    }
 
-    override fun mangaDetailsParse(response: Response): SManga {
-        val doc = response.asJsoup()
-        return SManga.create().apply {
-            title = doc.selectFirst(".post-title h1, h1.entry-title")?.text().orEmpty()
-            thumbnail_url = doc.selectFirst(".summary_image img, .thumb img")?.let(::imgUrl)
-            description = doc.selectFirst(
-                ".description-summary .summary__content, .summary__content, .entry-content[itemprop=description]",
-            )?.text()
-            genre = doc.select(".genres-content a, .mgen a").joinToString { it.text() }
-            val statusText = doc.selectFirst(".post-status .summary-content, .imptdt i")?.text().orEmpty()
-            status = when {
-                statusText.contains("ongoing", true) || statusText.contains("مستمر") -> SManga.ONGOING
-                statusText.contains("completed", true) || statusText.contains("مكتمل") -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
-            }
+    private fun parseDetails(document: Document, mangaUrl: String): SManga = SManga.create().apply {
+        url = mangaUrl
+        title = document.selectFirst(".post-title h1, .post-title h3, h1.entry-title")?.text().orEmpty()
+        thumbnail_url = document.selectFirst(".summary_image img, .thumb img")?.let(::imageUrl)
+        description = document.selectFirst(
+            ".description-summary .summary__content, .summary__content, .entry-content[itemprop=description]",
+        )?.text()
+        genre = document.select(".genres-content a, .mgen a").joinToString { it.text() }.ifBlank { null }
+        val statusText = document.selectFirst(".post-status .summary-content, .imptdt i")?.text().orEmpty()
+        status = when {
+            statusText.contains("ongoing", true) || statusText.contains("مستمر") -> SManga.ONGOING
+            statusText.contains("completed", true) || statusText.contains("مكتمل") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
         }
     }
 
-    // ---------- Chapters ----------
-
-    override fun chapterListParse(response: Response): List<SChapter> {
-        var doc = response.asJsoup()
-        var items = doc.select(CHAPTER_SELECTOR)
-
-        // Newer Madara sites load the chapter list through ajax
-        if (items.isEmpty() && theme() == Theme.MADARA) {
-            val ajaxUrl = response.request.url.toString().trimEnd('/') + "/ajax/chapters/"
-            doc = client.newCall(POST(ajaxUrl, headers)).execute().asJsoup()
-            items = doc.select(CHAPTER_SELECTOR)
+    private suspend fun parseChapters(document: Document, mangaUrl: String): List<SChapter> {
+        var items = document.select(CHAPTER_SELECTOR)
+        if (items.isEmpty() && theme() == Theme.Madara) {
+            val ajax = client.post(
+                "$baseUrl${mangaUrl.trimEnd('/')}/ajax/chapters/",
+                headersBuilder().set("X-Requested-With", "XMLHttpRequest").build(),
+                FormBody.Builder().build(),
+            ).asJsoup()
+            items = ajax.select(CHAPTER_SELECTOR)
         }
-
-        return items.map { el ->
-            val link = el.selectFirst("a")!!
+        return items.mapNotNull { element ->
+            val link = element.selectFirst("a") ?: return@mapNotNull null
+            val href = link.attr("abs:href").takeIf(String::isNotBlank) ?: return@mapNotNull null
             SChapter.create().apply {
-                setUrlWithoutDomain(link.absUrl("href"))
-                name = el.selectFirst(".chapternum")?.text() ?: link.text()
-                date_upload = 0L // TODO: parse the site's date format
+                url = href.toHttpUrl().encodedPath
+                name = element.selectFirst(".chapternum")?.text() ?: link.text()
             }
         }
     }
 
-    // ---------- Pages ----------
+    override fun getMangaUrl(manga: SManga): String = baseUrl + manga.url
 
-    override fun pageListParse(response: Response): List<Page> {
-        val doc = response.asJsoup()
+    override fun getChapterUrl(chapter: SChapter): String = baseUrl + chapter.url
 
-        // MangaThemesia: images live inside the ts_reader.run({...}) script
-        val script = doc.select("script").map { it.data() }.firstOrNull { "ts_reader" in it }
-        if (script != null) {
-            val arr = Regex("\"images\"\\s*:\\s*\\[(.*?)]", RegexOption.DOT_MATCHES_ALL)
-                .find(script)?.groupValues?.get(1)
-            if (arr != null) {
-                return Regex("\"(https?:[^\"]+)\"").findAll(arr)
-                    .mapIndexed { i, m -> Page(i, imageUrl = m.groupValues[1].replace("\\/", "/")) }
-                    .toList()
-            }
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val document = client.get(getChapterUrl(chapter)).asJsoup()
+
+        val script = document.select("script").map { it.data() }.firstOrNull { "ts_reader" in it }
+        val array = script?.let {
+            Regex("\"images\"\\s*:\\s*\\[(.*?)]", RegexOption.DOT_MATCHES_ALL).find(it)?.groupValues?.get(1)
+        }
+        if (array != null) {
+            return Regex("\"(https?:[^\"]+)\"").findAll(array).mapIndexed { index, match ->
+                Page(index, document.location(), match.groupValues[1].replace("\\/", "/"))
+            }.toList()
         }
 
-        // Madara / fallback: plain <img> tags
-        return doc.select(".reading-content img, #readerarea img, .page-break img")
-            .mapIndexedNotNull { i, img ->
-                imgUrl(img).takeIf { it.isNotBlank() }?.let { Page(i, imageUrl = it) }
+        return document.select(".reading-content img, #readerarea img, .page-break img")
+            .mapIndexedNotNull { index, element ->
+                imageUrl(element).takeIf { it.isNotBlank() }?.let { Page(index, document.location(), it) }
             }
     }
 
-    override fun imageUrlParse(response: Response): String =
-        throw UnsupportedOperationException()
+    override fun getFilterList(data: JsonElement?) = FilterList()
 
-    // ---------- Helpers ----------
-
-    private fun imgUrl(img: Element): String =
-        img.absUrl("data-src")
-            .ifEmpty { img.absUrl("data-lazy-src") }
-            .ifEmpty { img.absUrl("src") }
+    private fun imageUrl(element: Element): String = element.absUrl("data-src")
+        .ifEmpty { element.absUrl("data-lazy-src") }
+        .ifEmpty { element.absUrl("src") }
 
     companion object {
-        private const val BASE_URL_PREF = "base_url"
         private const val CHAPTER_SELECTOR = "li.wp-manga-chapter, #chapterlist li"
     }
 }
